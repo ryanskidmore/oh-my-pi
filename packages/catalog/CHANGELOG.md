@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `cloudflare-workers-ai` provider: Cloudflare Workers AI called directly, with the model list, pricing, context windows and reasoning ladders discovered live from the account's Workers AI models-search endpoint instead of a bundled list.
+
 ## [18.2.5] - 2026-09-17
 
 ### Added

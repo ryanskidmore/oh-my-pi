@@ -728,8 +728,35 @@ Cloudflare AI Gateway proxies requests through Cloudflare's edge infrastructure 
 
 ### Catalog model handling
 - **Descriptor & Default Model**: Wired via `anthropicMessagesDescriptor` with default model `anthropic/claude-opus-4-8` (`packages/catalog/src/provider-models/descriptors.ts`).
-- **Static Fallback Model**: Injects `CLOUDFLARE_FALLBACK_MODEL` (`claude-sonnet-4-5`, reasoning enabled, 200k context) during catalog generation when no models are returned by discovery (`packages/catalog/scripts/generated-policies.ts`, `packages/catalog/scripts/generate-models.ts:536-538`).
-- **Priority Wiring**: Assigned catalog priority level 39 in `providerPriority` (`packages/catalog/src/identity/priority.ts`).
+- **Static Fallback Model**: The fallback row is the authored `seed … bundle="empty"` block in `packages/catalog/src/compat/rules/providers/cloudflare-ai-gateway.kdl`, applied by `bundledSeedRows` in `packages/catalog/scripts/generate-models.ts` only when no other source produced a row for the provider.
+- **Priority Wiring**: Ranked in `DEFAULT_MODEL_PROVIDER_ORDER` (`packages/catalog/src/identity/priority.ts`), consumed by `buildModelProviderPriorityRank`, in the generic-gateway group.
+
+## Cloudflare Workers AI (`cloudflare-workers-ai`)
+Cloudflare Workers AI is called directly, not through AI Gateway: the account-scoped chat root is `https://api.cloudflare.com/client/v4/accounts/<account>/ai/v1` over the OpenAI Chat Completions transport, with `<account>` substituted in `packages/ai/src/registry/cloudflare-workers-ai.ts`.
+
+### Special casings
+- **Prompt-Cache Session Header**: `x-session-affinity` is sent via the `prompt-cache-session-header` wire axis declared in `packages/catalog/src/compat/rules/providers/cloudflare-workers-ai.kdl`, applied in `packages/ai/src/providers/openai-shared.ts:331`. Without it, `cached_tokens` is always 0.
+- **Forced Output Cap**: `always-send-max-tokens #true` in the provider KDL, because an omitted `max_tokens` makes the endpoint fall back to a 256-token default.
+- **Named Tool Choice Disabled**: `supports-named-tool-choice #false`; a named `tool_choice` returns HTTP 200 without calling the tool, while `tool_choice: "required"` works and stays enabled.
+- **Developer Role & Store Disabled**: `supports-developer-role #false` and `supports-store #false` in the provider KDL; both fields are accepted (HTTP 200) but not honored, so system prompts keep riding the `system` role.
+- **Reasoning Field Pinning**: `reasoning-content-field "reasoning_content"` in the provider KDL, because reasoning deltas are duplicated on `delta.reasoning` and `delta.reasoning_content`.
+- **Per-Model `none`-Effort Gating**: `reasoningDisableMode: "none-effort"` is set per model by the discovery mapper (`mapCloudflareWorkersAiModel` in `packages/catalog/src/provider-models/openai-compat.ts`) only when the model's `reasoning.supported_efforts` contains `"none"`, because sending `reasoning_effort: "none"` on a model that does not advertise it is an HTTP 400 (AiError code 8001).
+- **Cloudflare Error Envelope**: Cloudflare's `{"success":false,"errors":[{"code","message"}]}` body has no OpenAI-style `error` member, so `OpenAIHttpError.parseEnvelope` (`packages/ai/src/error/classes.ts`) falls through to its `errors` array to recover the message and code; without it the whole JSON body becomes the error message.
+- **Vision Requires Base64**: Image input must be a base64 `data:` URI; HTTP(S) `image_url` values are rejected.
+
+### Stream behavior
+- **Usage On Every Chunk**: Every streamed chunk carries a `usage` object with per-chunk deltas, and the chunk carrying `finish_reason` is emitted twice — first with zeroed usage, then again with the cumulative totals. `applyUsagePayload` (`packages/ai/src/providers/openai-completions.ts`) overwrites usage on each chunk, so last-wins produces the correct final totals.
+
+### Auth & usage
+- **Authentication Prompt**: Declared in `packages/catalog/src/compat/rules/auth/cloudflare-workers-ai.kdl` (`login "custom" hook="cloudflare-workers-ai"`), implemented in `packages/ai/src/registry/oauth/cloudflare-workers-ai.ts`, prompting for a Cloudflare API token (Workers AI: Read + Edit) and an account ID.
+- **Credential Shape**: The stored credential is one JSON string, `{"token":"<api token>","accountId":"<account id>"}`, produced by `serializeCloudflareWorkersAiCredential` and parsed by `parseCloudflareWorkersAiCredential` (`packages/catalog/src/wire/cloudflare-workers-ai.ts`); a bare non-`{` string parses as `{token}` only.
+- **Environment Resolution**: Reads `CLOUDFLARE_WORKERS_AI_API_KEY`, then `CLOUDFLARE_API_TOKEN`, for the token and `CLOUDFLARE_ACCOUNT_ID` (shared with `cloudflare-ai-gateway`) for the account, in `resolveWorkersAiCredential` (`packages/ai/src/registry/cloudflare-workers-ai.ts`).
+- **Rate Limits & Billing**: Frontier models are rate-limited to 20 requests/minute and other text-generation models to 300 requests/minute; billing is $0.011 per 1,000 neurons with 10,000 free neurons per day.
+
+### Catalog model handling
+- **No Bundled Rows, No Discovery Node**: The provider KDL (`packages/catalog/src/compat/rules/providers/cloudflare-workers-ai.kdl`) declares neither a `discovery` node nor a `seed`; the roster comes entirely from `GET {account}/ai/models/search?task=Text Generation&format=openrouter`, paginated by `cloudflareWorkersAiModelManagerOptions` (`packages/catalog/src/provider-models/openai-compat.ts`).
+- **Tool-Calling Filter**: A row is offered only when its `supported_features` contains `"tools"`, checked in `fetchCloudflareWorkersAiModels` (`packages/catalog/src/provider-models/openai-compat.ts`).
+- **Output Cap Fallback**: `max_output_length` is ignored because it echoes `context_length` rather than reporting a real cap; `maxTokens` falls back to `OPENAI_COMPAT_DISCOVERY_DEFAULT_MAX_TOKENS` (32,768) clamped to the model's context window.
 
 ## CoreWeave Serverless Inference (`coreweave`)
 CoreWeave Serverless Inference provides hosted AI model inference powered by Weights & Biases (W&B) infrastructure at `https://api.inference.wandb.ai/v1`. It operates using the "OpenAI Chat Completions" transport.

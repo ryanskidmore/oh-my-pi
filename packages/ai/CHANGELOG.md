@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `/login cloudflare-workers-ai`, which stores a Cloudflare API token together with the account ID and routes requests straight to Workers AI, sending `x-session-affinity` so prompt caching hits on follow-up turns in a session.
+
+### Fixed
+
+- Fixed Cloudflare API errors surfacing as a raw JSON body; the `{"success":false,"errors":[…]}` envelope now reports its message and code.
+
 ## [18.2.6] - 2026-09-18
 
 ### Fixed

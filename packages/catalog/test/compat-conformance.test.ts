@@ -24,6 +24,10 @@ const RUNTIME_ONLY_PROVIDERS = new Set([
 	// including its tariff and effort ladder, comes from the live /v1/models
 	// snapshot, so no bundled rows are frozen into models.json.
 	"charm-hyper",
+	// Account-scoped Workers AI discovery via cloudflareWorkersAiModelManagerOptions: the roster,
+	// tariff and effort ladders all come from the live models-search snapshot, so no bundled rows
+	// are frozen into models.json.
+	"cloudflare-workers-ai",
 	// User-configured LiteLLM proxy (models.yml provider or litellm auth flow;
 	// PROXY_OPENAI_COMPAT_PROVIDERS) that forwards upstream chat templates.
 	"litellm",

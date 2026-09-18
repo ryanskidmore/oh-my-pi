@@ -34,6 +34,11 @@ import { ALIBABA_TOKEN_PLAN_BASE_URL, parseAlibabaTokenPlanCredential } from "..
 import { normalizeCharmHyperBaseUrl } from "../wire/charm-hyper";
 import { CLINEPASS_API_BASE_URL, clinePassClientHeaders } from "../wire/cline-pass";
 import { CLOUDFLARE_AI_GATEWAY_COMPAT_BASE_URL } from "../wire/cloudflare-ai-gateway";
+import {
+	CLOUDFLARE_WORKERS_AI_BASE_URL,
+	toCloudflareWorkersAiModelsSearchUrl,
+	toCloudflareWorkersAiSpecBaseUrl,
+} from "../wire/cloudflare-workers-ai";
 import { coreWeaveProjectHeaders } from "../wire/coreweave";
 import {
 	COPILOT_API_HEADERS,
@@ -4765,6 +4770,206 @@ export function cloudflareAiGatewayModelManagerOptions(
 		"https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic",
 		config,
 	);
+}
+
+// ---------------------------------------------------------------------------
+// 19.5 Cloudflare Workers AI (direct, not via AI Gateway)
+// ---------------------------------------------------------------------------
+
+export interface CloudflareWorkersAiModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+	fetch?: FetchImpl;
+}
+
+/** Page size for models-search; the endpoint clamps anything above 100. */
+const CLOUDFLARE_WORKERS_AI_PAGE_SIZE = 100;
+/** Page bound: the Text Generation task lists ~30 rows, so this is pure runaway protection. */
+const CLOUDFLARE_WORKERS_AI_MAX_PAGES = 20;
+/** Only the text-generation task can back a chat turn. */
+const CLOUDFLARE_WORKERS_AI_TASK = "Text Generation";
+/** Capability token that marks a row as usable by a tool-calling agent. */
+const CLOUDFLARE_WORKERS_AI_TOOLS_FEATURE = "tools";
+/** Capability token that marks a row as a reasoning model. */
+const CLOUDFLARE_WORKERS_AI_REASONING_FEATURE = "reasoning";
+/** Wire tier that switches reasoning off; a 400 (code 8001) on rows that do not advertise it. */
+const CLOUDFLARE_WORKERS_AI_EFFORT_NONE = "none";
+
+/**
+ * One row of `GET {account}/ai/models/search?format=openrouter`, verified live 2026-09-18.
+ *
+ * The OpenRouter projection is used rather than the native property list because it publishes the
+ * same facts in shapes this file already has mappers for — per-token USD price strings including
+ * `input_cache_read`, an `input_modalities` array, a `supported_features` capability list, and the
+ * identical `reasoning.supported_efforts` / `default_effort` / `mandatory` object that
+ * `mapOpenRouterThinking` reads — and it already omits the four adapter-only LoRA bases that carry
+ * no price at all. `max_output_length` is deliberately NOT read: Cloudflare echoes
+ * `context_length` into it, so it is not an output cap.
+ */
+interface CloudflareWorkersAiModelRecord extends OpenAICompatibleModelRecord {
+	input_modalities?: unknown;
+	context_length?: unknown;
+	pricing?: unknown;
+	supported_features?: unknown;
+	reasoning?: unknown;
+}
+
+/** Distinct capability tokens advertised for a row. */
+function cloudflareWorkersAiFeatures(value: unknown): readonly string[] {
+	return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+/**
+ * Workers AI quotes USD per token as a decimal string; omp stores per-million. A rate the endpoint
+ * omits is reported as 0 rather than invented: only models that publish a cached-input rate support
+ * prompt caching at all, so a missing `input_cache_read` never mis-bills a real cache hit.
+ */
+function toCloudflareWorkersAiRate(value: unknown): number {
+	const parsed = typeof value === "string" ? Number.parseFloat(value) : toNumber(value);
+	return typeof parsed === "number" && Number.isFinite(parsed) && parsed >= 0 ? parsed * 1_000_000 : 0;
+}
+
+function mapCloudflareWorkersAiModel(
+	record: CloudflareWorkersAiModelRecord,
+	defaults: ModelSpec<"openai-completions">,
+): ModelSpec<"openai-completions"> {
+	const features = cloudflareWorkersAiFeatures(record.supported_features);
+	const thinking = mapOpenRouterThinking(record);
+	const supportedEfforts = isRecord(record.reasoning) ? record.reasoning.supported_efforts : undefined;
+	const canDisableThinking =
+		Array.isArray(supportedEfforts) && supportedEfforts.includes(CLOUDFLARE_WORKERS_AI_EFFORT_NONE);
+	const modalities = Array.isArray(record.input_modalities) ? record.input_modalities : [];
+	const contextWindow = toPositiveNumber(record.context_length, defaults.contextWindow);
+	const pricing = isRecord(record.pricing) ? record.pricing : undefined;
+	return {
+		...defaults,
+		name: toModelName(record.name, defaults.name),
+		// `supported_features` is the authoritative capability list. A `reasoning` object is present
+		// only for rows that also publish an effort vocabulary, so rows that reason without a dial
+		// (gpt-oss, nemotron) still report `reasoning: true` and inherit their lineage ladder from
+		// the KDL cascade.
+		reasoning: features.includes(CLOUDFLARE_WORKERS_AI_REASONING_FEATURE),
+		...(thinking !== undefined && { thinking }),
+		input: modalities.includes("image") ? ["text", "image"] : ["text"],
+		contextWindow,
+		// Workers AI publishes no output cap (`max_output_length` echoes the context window) and
+		// falls back to 256 tokens when a request omits one, so every row carries the shared
+		// discovery default clamped to its context. KDL `limits-patch` owns per-model corrections.
+		maxTokens: Math.min(
+			contextWindow ?? OPENAI_COMPAT_DISCOVERY_DEFAULT_MAX_TOKENS,
+			OPENAI_COMPAT_DISCOVERY_DEFAULT_MAX_TOKENS,
+		),
+		cost: {
+			input: toCloudflareWorkersAiRate(pricing?.prompt),
+			output: toCloudflareWorkersAiRate(pricing?.completion),
+			cacheRead: toCloudflareWorkersAiRate(pricing?.input_cache_read),
+			cacheWrite: 0,
+		},
+		// Only rows advertising the `none` tier can be switched off on the wire; sending
+		// `reasoning_effort: "none"` anywhere else is an HTTP 400 (AiError code 8001), so the rest
+		// keep the dialect default (`lowest-effort`), which never emits `none`.
+		...(thinking !== undefined && canDisableThinking
+			? { compat: { reasoningDisableMode: "none-effort" as const } }
+			: {}),
+	};
+}
+
+/**
+ * Enumerate Workers AI text-generation models.
+ *
+ * `GET {base}/v1/models` does not exist on this host (HTTP 405, code 7001), so the account-scoped
+ * models-search endpoint is the only roster and generic OpenAI-compatible discovery cannot be used.
+ * `result_info.total_count` counts every task rather than the filtered set (308 vs 31 rows), so
+ * pagination stops on a short page instead of trusting it. Returns null on any transport or
+ * protocol failure, so the manager keeps its cached roster rather than caching a truncated list as
+ * authoritative.
+ */
+async function fetchCloudflareWorkersAiModels(options: {
+	baseUrl: string;
+	apiKey: string;
+	fetch?: FetchImpl;
+}): Promise<ModelSpec<"openai-completions">[] | null> {
+	const searchUrl = toCloudflareWorkersAiModelsSearchUrl(options.baseUrl);
+	const specBaseUrl = toCloudflareWorkersAiSpecBaseUrl(options.baseUrl);
+	const fetchImpl = discoveryFetch(options.fetch);
+	const collected = new Map<string, ModelSpec<"openai-completions">>();
+	for (let page = 1; page <= CLOUDFLARE_WORKERS_AI_MAX_PAGES; page++) {
+		const url = new URL(searchUrl);
+		url.searchParams.set("task", CLOUDFLARE_WORKERS_AI_TASK);
+		url.searchParams.set("format", "openrouter");
+		url.searchParams.set("per_page", String(CLOUDFLARE_WORKERS_AI_PAGE_SIZE));
+		url.searchParams.set("page", String(page));
+		let response: Response;
+		try {
+			response = await fetchImpl(url.toString(), {
+				method: "GET",
+				headers: { Accept: "application/json", Authorization: `Bearer ${options.apiKey}` },
+			});
+		} catch {
+			return null;
+		}
+		if (!response.ok) return null;
+		let payload: unknown;
+		try {
+			payload = await response.json();
+		} catch {
+			return null;
+		}
+		if (!isRecord(payload) || !Array.isArray(payload.data)) return null;
+		for (const entry of payload.data) {
+			if (!isRecord(entry)) continue;
+			const record = entry as CloudflareWorkersAiModelRecord;
+			const id = typeof record.id === "string" ? record.id.trim() : "";
+			if (!id) continue;
+			// A tool-driven coding agent cannot use a model without function calling. This one
+			// predicate is the whole roster filter: the openrouter projection already drops the
+			// adapter-only LoRA bases, and the endpoint hides deprecated models by default.
+			if (!cloudflareWorkersAiFeatures(record.supported_features).includes(CLOUDFLARE_WORKERS_AI_TOOLS_FEATURE)) {
+				continue;
+			}
+			const defaults: ModelSpec<"openai-completions"> = {
+				id,
+				name: id,
+				api: "openai-completions",
+				provider: "cloudflare-workers-ai",
+				baseUrl: specBaseUrl,
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: null,
+				maxTokens: null,
+			};
+			collected.set(id, mapCloudflareWorkersAiModel(record, defaults));
+		}
+		if (payload.data.length < CLOUDFLARE_WORKERS_AI_PAGE_SIZE) break;
+	}
+	return Array.from(collected.values()).sort((left, right) => left.id.localeCompare(right.id));
+}
+
+/**
+ * Cloudflare Workers AI called directly. Discovery is authoritative: a model Cloudflare stops
+ * serving is pruned rather than kept alive by a bundled row, and there are no bundled rows at all.
+ *
+ * `cacheProviderId` is deliberately left at the provider id. The roster is Cloudflare's public
+ * model catalog and is identical for every account, so one namespace is correct; keying it on the
+ * account-substituted base URL would split it against the credential-free namespace
+ * `ModelRegistry.#resolveStartupModelCacheProviderId` computes at startup and miss forever.
+ */
+export function cloudflareWorkersAiModelManagerOptions(
+	config?: CloudflareWorkersAiModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? CLOUDFLARE_WORKERS_AI_BASE_URL;
+	// Without a resolved account id the endpoint path cannot be formed at all; the provider
+	// transport's `prepareModelDiscovery` substitutes it before this factory runs.
+	const discoverable = apiKey !== undefined && apiKey.length > 0 && !baseUrl.includes("<account>");
+	return {
+		providerId: "cloudflare-workers-ai",
+		dynamicModelsAuthoritative: true,
+		...(discoverable && {
+			fetchDynamicModels: () => fetchCloudflareWorkersAiModels({ baseUrl, apiKey, fetch: config?.fetch }),
+		}),
+	};
 }
 
 // ---------------------------------------------------------------------------

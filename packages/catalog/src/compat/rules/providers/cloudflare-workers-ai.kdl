@@ -47,6 +47,20 @@ provider "cloudflare-workers-ai" priority=-1 {
 	// stay off and system prompts ride the `system` role, matching every sibling gateway.
 	supports-developer-role #false
 	supports-store #false
+	// Every request is validated against the served model's own JSON Schema, and five rows type
+	// `messages[].content` as a string OR ONE content part: a message whose content array holds
+	// two or more parts fails with HTTP 400 `AiError: Bad input: Error: oneOf at '/' not met …
+	// Type mismatch of '/messages/N/content'` (code 5006). omp emits one text part per context
+	// block, so an ordinary "environment preamble + question" user turn tripped it. Censused
+	// 2026-09-18 on @cf/openai/gpt-oss-120b, @cf/openai/gpt-oss-20b,
+	// @cf/meta/llama-3.3-70b-instruct-fp8-fast, @cf/ibm-granite/granite-4.0-h-micro and
+	// @cf/qwen/qwen3-30b-a3b-fp8: a two-part array is rejected whether the sibling messages are
+	// strings or arrays (so "make every message an array" is NOT a fix), a one-part array is
+	// accepted, and a plain string is accepted by all 18 rows. Image parts are exempt — they
+	// have no string encoding, and they only reach the multimodal rows, which accept a
+	// multi-part array beside a string system prompt (verified on
+	// @cf/meta/llama-4-scout-17b-16e-instruct).
+	requires-string-message-content #true
 	// `tool_choice: {type:"function", …}` returns 200 but the model answers with plain text instead
 	// of calling the named tool (verified 2026-09-18 on @cf/zai-org/glm-4.7-flash).
 	// `tool_choice: "required"` does force a call and stays enabled.

@@ -296,6 +296,18 @@ export interface OpenAICompat {
 	qwenTemplateReasoningEffort?: boolean;
 	/** Whether assistant tool-call messages must include non-empty content. Default: false. */
 	requiresAssistantContentForToolCalls?: boolean;
+	/**
+	 * Whether text `messages[].content` must ride as a plain string rather than
+	 * a parts array. Some hosts validate each request against the served model's
+	 * own JSON Schema, and a schema that types `content` as a string *or one*
+	 * content part rejects an array of two or more parts outright, whatever the
+	 * rest of the request looks like. When true, request builders collapse every
+	 * text-only content array into one string joined by `\n`. Content that
+	 * carries a non-text part (an image, which has no string encoding) keeps the
+	 * array; such content only reaches multimodal rows, which accept multi-part
+	 * arrays. Default: unset (off).
+	 */
+	requiresStringMessageContent?: boolean;
 	/** Whether the provider supports the `tool_choice` parameter. Default: true. */
 	supportsToolChoice?: boolean;
 	/**
@@ -806,6 +818,7 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "requiresToolResultName"
 			| "requiresAssistantAfterToolResult"
 			| "requiresAssistantContentForToolCalls"
+			| "requiresStringMessageContent"
 			| "stripDeepseekSpecialTokens"
 			| "streamMarkupHealingPattern"
 			| "reasoningDeltasMayBeCumulative"
@@ -848,6 +861,13 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 		isVercelGatewayHost: boolean;
 		/** Send the normalized prompt-cache key as top-level `prompt_cache_key` on chat completions. */
 		supportsPromptCacheKey: boolean;
+		/**
+		 * See {@link OpenAICompat.requiresStringMessageContent}. Left unassigned
+		 * rather than materialized false: no host identity implies it, so only an
+		 * explicit rule or user override can turn it on, and bundled rows stay free
+		 * of a key that is absent from every one of them.
+		 */
+		requiresStringMessageContent?: boolean;
 		dropThinkingWhenReasoningEffort: boolean;
 		/** Complete alternate view for thinking-engaged requests; swap pointers, never spread. */
 		whenThinking?: ResolvedOpenAICompat;

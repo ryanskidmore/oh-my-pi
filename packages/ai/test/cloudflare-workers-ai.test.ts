@@ -22,7 +22,15 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import type { OAuthController } from "@oh-my-pi/pi-ai/oauth/types";
 import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
 import { stream } from "@oh-my-pi/pi-ai/stream";
-import type { AssistantMessage, FetchImpl, Model, ThinkingContent, ToolCall } from "@oh-my-pi/pi-ai/types";
+import type {
+	AssistantMessage,
+	Context,
+	FetchImpl,
+	Model,
+	ThinkingContent,
+	ToolCall,
+	Usage,
+} from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import {
@@ -44,6 +52,37 @@ const WORKERS_MODEL = buildModel({
 	contextWindow: 131_072,
 	maxTokens: 32_768,
 	thinking: { mode: "effort", efforts: [Effort.Low, Effort.Medium, Effort.High] },
+});
+
+/** A multimodal row: the only kind that can ever carry an image part. */
+const WORKERS_VISION_MODEL = buildModel({
+	id: "@cf/meta/llama-4-scout-17b-16e-instruct",
+	name: "Llama 4 Scout",
+	api: "openai-completions",
+	provider: "cloudflare-workers-ai",
+	baseUrl: CLOUDFLARE_WORKERS_AI_BASE_URL,
+	reasoning: false,
+	input: ["text", "image"],
+	cost: { input: 0.27, output: 0.85, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 131_072,
+	maxTokens: 32_768,
+});
+
+/**
+ * The gateway mirror carries the same `@cf/...` SKUs behind a different provider id, so it is
+ * the sharpest control for a provider-scoped wire axis.
+ */
+const GATEWAY_MODEL = buildModel({
+	id: "workers-ai/@cf/zai-org/glm-4.7-flash",
+	name: "GLM 4.7 Flash (gateway)",
+	api: "openai-completions",
+	provider: "cloudflare-ai-gateway",
+	baseUrl: "https://gateway.ai.cloudflare.com/v1/acct-test/my-gateway/workers-ai",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0.0605, output: 0.4, cacheRead: 0.03, cacheWrite: 0 },
+	contextWindow: 131_072,
+	maxTokens: 32_768,
 });
 
 const CONTEXT = { messages: [{ role: "user" as const, content: "What is the weather in Paris?", timestamp: 0 }] };
@@ -167,6 +206,22 @@ interface CapturedRequest {
 	headers?: Headers;
 	body?: string;
 }
+
+/** The wire projection of one request message, as far as these tests inspect it. */
+interface BodyMessage {
+	role: string;
+	content: unknown;
+	tool_calls?: Array<{ function: { name: string } }>;
+}
+
+const EMPTY_USAGE: Usage = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
 
 function captureRequest(captured: CapturedRequest, sse?: string): FetchImpl {
 	return Object.assign(
@@ -417,6 +472,134 @@ describe("Cloudflare Workers AI streamed turns", () => {
 		expect(message.usage.input).toBe(50);
 		expect(message.usage.cost.cacheRead).toBeCloseTo((25_984 / 1e6) * 0.03, 10);
 		expect(message.usage.cost.input).toBeCloseTo((50 / 1e6) * 0.0605, 10);
+	});
+});
+
+describe("Cloudflare Workers AI message-content shape", () => {
+	// Five rows validate a request against the served model's own JSON Schema, which types
+	// `messages[].content` as a string OR ONE content part. omp emits one text part per context
+	// block, so a user turn carrying an environment preamble plus a question was a two-part
+	// array, and @cf/openai/gpt-oss-120b, @cf/openai/gpt-oss-20b,
+	// @cf/meta/llama-3.3-70b-instruct-fp8-fast, @cf/ibm-granite/granite-4.0-h-micro and
+	// @cf/qwen/qwen3-30b-a3b-fp8 answered HTTP 400 `AiError: Bad input … Type mismatch of
+	// '/messages/N/content'` (code 5006). Censused live 2026-09-18: a two-part array is rejected
+	// regardless of what the sibling messages carry (so "make every message an array" is NOT an
+	// alternative fix), while a plain string is accepted by all 18 rows.
+
+	async function capturedBody(model: Model, context: Context): Promise<{ messages: BodyMessage[] }> {
+		const captured: CapturedRequest = {};
+		await stream(model, context, { apiKey: TEST_CREDENTIAL, fetch: captureRequest(captured) }).result();
+		return JSON.parse(captured.body ?? "{}");
+	}
+
+	test("a system prompt and a multi-block user turn both ride as plain strings", async () => {
+		const body = await capturedBody(WORKERS_MODEL, {
+			systemPrompt: ["You are omp."],
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "Environment: /repo" },
+						{ type: "text", text: "What is the weather in Paris?" },
+					],
+					timestamp: 0,
+				},
+			],
+		});
+
+		expect(body.messages.map(message => message.role)).toEqual(["system", "user"]);
+		for (const message of body.messages) expect(typeof message.content).toBe("string");
+		expect(body.messages[0]?.content).toBe("You are omp.");
+		// `\n` is the separator omp already uses when flattening content blocks into one string
+		// (batched tool results here, `toPlainContent` in the Ollama chat transport).
+		expect(body.messages[1]?.content).toBe("Environment: /repo\nWhat is the weather in Paris?");
+	});
+
+	test("a tool-call round trip stays string-shaped end to end", async () => {
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call_abc123", name: "get_weather", arguments: { city: "Paris" } }],
+			api: "openai-completions",
+			provider: "cloudflare-workers-ai",
+			model: WORKERS_MODEL.id,
+			usage: EMPTY_USAGE,
+			stopReason: "toolUse",
+			timestamp: 1,
+		};
+		const body = await capturedBody(WORKERS_MODEL, {
+			systemPrompt: ["You are omp."],
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "Weather in Paris?" }], timestamp: 0 },
+				assistant,
+				{
+					role: "toolResult",
+					toolCallId: "call_abc123",
+					toolName: "get_weather",
+					content: [{ type: "text", text: "18C sunny" }],
+					isError: false,
+					timestamp: 2,
+				},
+				{ role: "user", content: [{ type: "text", text: "Thanks." }], timestamp: 3 },
+			],
+		});
+
+		expect(body.messages.map(message => message.role)).toEqual(["system", "user", "assistant", "tool", "user"]);
+		for (const message of body.messages) expect(typeof message.content).toBe("string");
+		// Live: the strict rows reject `content: null` on an assistant tool-call turn just as
+		// hard, so the existing empty-string normalization must survive the collapse.
+		expect(body.messages[2]?.content).toBe("");
+		expect(body.messages[2]?.tool_calls?.[0]?.function.name).toBe("get_weather");
+		expect(body.messages[3]?.content).toBe("18C sunny");
+	});
+
+	test("an image part keeps its array beside a string system prompt", async () => {
+		const body = await capturedBody(WORKERS_VISION_MODEL, {
+			systemPrompt: ["You are omp."],
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "What colour is this?" },
+						{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+					],
+					timestamp: 0,
+				},
+			],
+		});
+
+		// An image has no string encoding, so its content stays a (two-part) array. Only
+		// multimodal rows ever receive one — the vision guard swaps an image for a placeholder
+		// text part on text-only rows — and they accept a multi-part array beside a string
+		// system prompt; verified live on @cf/meta/llama-4-scout-17b-16e-instruct.
+		expect(body.messages[0]?.content).toBe("You are omp.");
+		expect(body.messages[1]?.content).toEqual([
+			{ type: "text", text: "What colour is this?" },
+			{ type: "image_url", image_url: { url: "data:image/png;base64,ZmFrZQ==" } },
+		]);
+	});
+
+	test("the gateway mirror of the same SKU still sends a parts array", async () => {
+		// The axis is declared on provider `cloudflare-workers-ai` only; every other
+		// openai-completions provider keeps the untouched default.
+		expect(GATEWAY_MODEL.compat.requiresStringMessageContent).toBeUndefined();
+		const body = await capturedBody(GATEWAY_MODEL, {
+			systemPrompt: ["You are omp."],
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "Environment: /repo" },
+						{ type: "text", text: "What is the weather in Paris?" },
+					],
+					timestamp: 0,
+				},
+			],
+		});
+
+		expect(body.messages[1]?.content).toEqual([
+			{ type: "text", text: "Environment: /repo" },
+			{ type: "text", text: "What is the weather in Paris?" },
+		]);
 	});
 });
 

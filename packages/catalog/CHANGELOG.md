@@ -5,6 +5,7 @@
 ### Added
 
 - Added the `cloudflare-workers-ai` provider: Cloudflare Workers AI called directly, with the model list, pricing, context windows and reasoning ladders discovered live from the account's Workers AI models-search endpoint instead of a bundled list.
+- Added the `requiresStringMessageContent` compat option for OpenAI-compatible endpoints whose per-model schema rejects a multi-part `messages[].content` array: text content is sent as one plain string joined by `\n`, while content carrying an image keeps its array. Enabled for `cloudflare-workers-ai`.
 
 ## [18.2.5] - 2026-09-17
 

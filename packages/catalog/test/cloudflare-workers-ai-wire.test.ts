@@ -79,6 +79,37 @@ describe("Cloudflare Workers AI resolved compat", () => {
 		// The default never sends the 400-producing `reasoning_effort: "none"`.
 		expect(model.compat.reasoningDisableMode).not.toBe("none-effort");
 	});
+
+	test("every row demands plain-string message content", () => {
+		// Five rows validate against a per-model JSON Schema that types `messages[].content`
+		// as a string or ONE content part, and 400 (code 5006) on an array of two or more.
+		// The axis is declared at the provider root, so it holds for text-only and
+		// multimodal rows alike; image parts stay arrays because the transport exempts
+		// non-text content, not because the flag is off for vision rows.
+		expect(buildModel(workersAiSpec()).compat.requiresStringMessageContent).toBe(true);
+		expect(
+			buildModel(workersAiSpec({ id: "@cf/openai/gpt-oss-120b", name: "GPT-OSS 120B", input: ["text"] })).compat
+				.requiresStringMessageContent,
+		).toBe(true);
+	});
+
+	test("the gateway mirror of the same SKU is unaffected", () => {
+		// `cloudflare-ai-gateway` projects these SKUs under a `workers-ai/` prefix on a
+		// different route; the axis is provider-scoped and must not reach it (nor any other
+		// openai-completions provider, which all keep the unassigned default).
+		const mirrored = buildModel(
+			workersAiSpec({
+				id: "workers-ai/@cf/zai-org/glm-5.3-flash",
+				provider: "cloudflare-ai-gateway",
+				baseUrl: "https://gateway.ai.cloudflare.com/v1/acct-test/my-gateway/workers-ai",
+			}),
+		);
+		expect(mirrored.compat.requiresStringMessageContent).toBeUndefined();
+		expect(
+			buildModel(workersAiSpec({ provider: "openai", baseUrl: "https://api.openai.com/v1" })).compat
+				.requiresStringMessageContent,
+		).toBeUndefined();
+	});
 });
 
 describe("Cloudflare Workers AI effort ladder", () => {

@@ -1990,6 +1990,47 @@ function maybeAddAnthropicCacheControl(compat: ResolvedOpenAICompat, messages: C
 	}
 }
 
+/**
+ * Collapse every text-only `content` array into one plain string.
+ *
+ * Some OpenAI-compatible hosts validate each request against the served model's
+ * own JSON Schema, and several Cloudflare Workers AI rows declare
+ * `messages[].content` as a string *or one* content part: an array holding two
+ * or more parts fails with HTTP 400 `AiError: Bad input … oneOf at '/' not met …
+ * Type mismatch of '/messages/N/content'` (code 5006), no matter what the other
+ * messages carry. A parts array is only ever multi-part here because omp emits
+ * one text part per context block, so collapsing text removes the whole failure
+ * mode; a plain string is accepted by every row.
+ *
+ * Content carrying a non-text part keeps the array: an image has no string
+ * encoding. That is safe because image parts only reach multimodal rows, and
+ * those rows accept a multi-part array beside a string system prompt — the
+ * text-only rows that enforce the strict schema never see one, because
+ * {@link convertMessages}'s vision guard has already swapped the image for a
+ * placeholder text part.
+ *
+ * Text parts join with `\n` — the separator this codebase already uses when
+ * flattening content blocks into one string (batched tool results in
+ * {@link convertMessages}, and `toPlainContent` in the Ollama chat transport).
+ *
+ * Called last in {@link convertMessages} so the prompt-cache annotators that
+ * re-inflate a string into an annotated parts array
+ * (`maybeAddAnthropicCacheControl`, `markLatestStableChatCompletionsCacheBreakpoint`)
+ * run afterwards and keep their arrays. Neither is reachable for a model that
+ * sets this flag — it pairs with `cacheControlFormat: undefined` and
+ * `supportsPromptCacheBreakpoints: false` — but the ordering keeps the two
+ * policies independent rather than racing over the same field.
+ */
+function collapseTextOnlyMessageContent(messages: ChatCompletionMessageParam[]): void {
+	for (const message of messages) {
+		const content = message.content;
+		if (!Array.isArray(content)) continue;
+		const textParts = content.filter(part => part.type === "text");
+		if (textParts.length !== content.length) continue;
+		message.content = textParts.map(part => part.text).join("\n");
+	}
+}
+
 export function convertMessages(
 	model: Model<"openai-completions">,
 	context: Context,
@@ -2477,6 +2518,8 @@ export function convertMessages(
 					: "system"
 				: msg.role;
 	}
+
+	if (compat.requiresStringMessageContent) collapseTextOnlyMessageContent(params);
 
 	return params;
 }

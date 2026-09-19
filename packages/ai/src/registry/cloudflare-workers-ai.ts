@@ -15,7 +15,7 @@ interface ResolvedWorkersAiCredential {
 /** One JSON credential carries the API token and the account the `<account>` base URL needs. */
 function resolveWorkersAiCredential(apiKey: string | undefined): ResolvedWorkersAiCredential | null {
 	const credential = parseCloudflareWorkersAiCredential(
-		apiKey ?? $pickenv("CLOUDFLARE_WORKERS_AI_API_KEY", "CLOUDFLARE_API_TOKEN") ?? "",
+		apiKey || $pickenv("CLOUDFLARE_WORKERS_AI_API_KEY", "CLOUDFLARE_API_TOKEN") || "",
 	);
 	if (!credential) return null;
 	const accountId = (credential.accountId ?? $env.CLOUDFLARE_ACCOUNT_ID)?.trim();

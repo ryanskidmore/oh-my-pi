@@ -310,6 +310,27 @@ describe("Cloudflare Workers AI login and request shaping", () => {
 		);
 	});
 
+	test("an explicit empty apiKey falls back to the environment rather than silently no-opping", async () => {
+		// A caller (or an upstream default) that resolves to `apiKey: ""` must NOT win over the
+		// environment fallback: `""` is not a credential, so it has to behave exactly like `undefined`.
+		await withEnv(
+			{
+				...NO_CLOUDFLARE_ENV,
+				CLOUDFLARE_WORKERS_AI_API_KEY: "env-token",
+				CLOUDFLARE_ACCOUNT_ID: "env-account",
+			},
+			() => {
+				const prepared = prepareWorkersAiRequest(WORKERS_MODEL, "");
+				expect(prepared?.model.baseUrl).toBe("https://api.cloudflare.com/client/v4/accounts/env-account/ai/v1");
+				expect(prepared?.options.apiKey).toBe("env-token");
+			},
+		);
+
+		await withEnv({ ...NO_CLOUDFLARE_ENV, CLOUDFLARE_WORKERS_AI_API_KEY: "env-token" }, () => {
+			expect(() => prepareWorkersAiRequest(WORKERS_MODEL, "")).toThrow(AIError.ConfigurationError);
+		});
+	});
+
 	test("an explicit non-template base URL is left alone", () => {
 		const selfHosted = { ...WORKERS_MODEL, baseUrl: "https://workers-ai.internal.example/v1" };
 		const prepared = prepareWorkersAiRequest(selfHosted, TEST_CREDENTIAL);

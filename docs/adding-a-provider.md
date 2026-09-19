@@ -18,15 +18,40 @@ through generated, typed accessors.
 | Request shaping | `TRANSPORTS` in `packages/ai/src/registry/registry.ts` + `packages/ai/src/registry/<id>.ts` | `prepareModel` / `prepareRequest` / `mapSimpleOptions` / `prepareModelDiscovery` |
 | Login flow | a hook table in `packages/ai/src/registry/hooks/` + `packages/ai/src/registry/oauth/<id>.ts` | whole-flow logins the KDL grammar cannot express |
 
-A plain API-key provider on an existing wire API (`openai-completions`, `anthropic-messages`,
-`google-generative-ai`, …) that reuses bundled or generically-discovered rows needs only rows 1 and
-2 — see [Choosing a catalog shape](#choosing-a-catalog-shape). The exact KDL syntax for row 1 is the
+Most providers touch three of these five rows, not two: of the 76 catalog providers compiled into
+`packages/catalog/src/compat/rules.json`, 67 have a `MODEL_MANAGER_FACTORIES` entry (row 3). For a
+provider on a plain OpenAI-compatible host, that entry is almost always a one-line wrapper around
+`createSimpleOpenAICompletionsOptions(providerId, baseUrl, config)`
+(`packages/catalog/src/provider-models/openai-compat.ts`) — the shortest real example,
+`groqModelManagerOptions`:
+
+```ts
+export function groqModelManagerOptions(config?: GroqModelManagerConfig): ModelManagerOptions<"openai-completions"> {
+	return createSimpleOpenAICompletionsOptions("groq", "https://api.groq.com/openai/v1", config);
+}
+```
+
+paired with `groq: config => groqModelManagerOptions(config),` in `MODEL_MANAGER_FACTORIES`. A plain
+API-key provider on an existing wire API (`openai-completions`, `anthropic-messages`,
+`google-generative-ai`, …) that reuses bundled or generically-discovered rows needs rows 1, 2, and
+this one-line row 3 — see [Choosing a catalog shape](#choosing-a-catalog-shape) for which KDL shape
+row 1 should take. The exact KDL syntax for row 1 is the
 [Provider catalog grammar](../packages/catalog/src/compat/rules/README.md#provider-catalog-grammar)
 section of `packages/catalog/src/compat/rules/README.md`; for row 2 it's that same file's
 [Auth grammar](../packages/catalog/src/compat/rules/README.md#auth-grammar) section — this document
-does not repeat that grammar, only how the pieces fit together. Rows 3–5 exist for the cases that
-need code: a bespoke discovery response shape, request/header rewrites, or a login flow with more
-than one prompt.
+does not repeat that grammar, only how the pieces fit together.
+
+The 9 providers with **no** `MODEL_MANAGER_FACTORIES` entry (`amazon-bedrock`, `azure`,
+`gitlab-duo`, the three MiniMax variants, and the OAuth-driven `google-antigravity` /
+`google-gemini-cli` / `openai-codex`) are excluded from `PROVIDER_DESCRIPTORS` entirely and get no
+runtime discovery/refresh through this table: the bedrock/azure/gitlab-duo/MiniMax group is served
+from bundled `models.json` rows only, with no live refresh, while the three OAuth-driven ids get a
+bespoke manager the coding-agent runtime builds directly
+(`SPECIAL_MODEL_MANAGER_PROVIDER_IDS` in
+`packages/coding-agent/src/config/model-provider-discovery.ts`) instead of going through this table.
+
+Rows 4 and 5 exist only for the cases that need code beyond a one-line factory: a bespoke discovery
+response shape, request/header rewrites, or a login flow with more than one prompt.
 
 Adding a **new wire protocol** (a new member of `Api`) is a different, larger task: it also touches
 the dispatch `switch` in `packages/ai/src/stream.ts`, `packages/ai/src/api-registry.ts`, and the
@@ -35,10 +60,13 @@ existing `Api`.
 
 ## Worked example: Cloudflare Workers AI
 
-`cloudflare-workers-ai` (added on `feat/cloudflare-workers-ai`) is a provider with zero bundled
-rows, a custom login flow, and a request-shaping transport — it touches all five rows. Read
-`packages/catalog/src/compat/rules/providers/charm-hyper.kdl` alongside it for the sibling that
-needed *only* row 1.
+`cloudflare-workers-ai` is a provider with zero bundled rows, a custom login flow, and a
+request-shaping transport — it touches all five rows. For the opposite end of the spectrum, read
+`packages/catalog/src/compat/rules/providers/minimax.kdl` and
+`packages/catalog/src/compat/rules/auth/minimax.kdl` alongside it: `minimax` touches only rows 1
+and 2 — a `default-model`, an `env` fallback, and one wire-compat axis in the provider KDL, and just
+a display `name` with no `login` node at all (env-key only) in the auth KDL. It has no
+`MODEL_MANAGER_FACTORIES` entry, no `TRANSPORTS` entry, and no login hook.
 
 ### 1. Provider KDL — catalog entry, wire axes, and why there's no `discovery` or `seed`
 
@@ -88,10 +116,10 @@ The rest of the block is wire-compat axes from the closed vocabulary in
 refinement. Each one exists because it was measured against the live endpoint, not guessed; see
 `docs/provider-quirks.md`'s "Cloudflare Workers AI" section for the measurements.
 
-`priority=-1` and the bare `thinking-efforts "low" "medium" "high"` are a real
-cascade-ambiguity resolution, added after ship in commit `1d3c0fd7c2`. Reasoning rows that publish
-no `reasoning.supported_efforts` vocabulary at all (`nemotron-3-120b-a12b`, `glm-4.7-flash`, and
-others) fell through to the generic five-tier `minimal/low/medium/high/xhigh` default, and the
+`priority=-1` and the bare `thinking-efforts "low" "medium" "high"` are a real cascade-ambiguity
+resolution. Reasoning rows that publish no `reasoning.supported_efforts` vocabulary at all
+(`nemotron-3-120b-a12b`, `glm-4.7-flash`, and others) fell through to the generic five-tier
+`minimal/low/medium/high/xhigh` default, and the
 endpoint 400s (AiError code 8001) on `minimal` and `xhigh`. The fix — a provider-root
 `thinking-efforts "low" "medium" "high"` — ties in rank with `classes/gpt-oss.kdl`'s unconditioned
 class-root `thinking-efforts "low" "medium" "high"` (both rank at
@@ -311,9 +339,13 @@ long-lived mutation of `Bun.env`/`process.env` — use the `withEnv` helper at
 6. `packages/catalog/test/compat-conformance.test.ts` — add to `RUNTIME_ONLY_PROVIDERS` if the
    provider has no bundled rows.
 7. Run `bun run gen:compat`; commit `rules.json`, `provider-ids.ts`, `auth-ids.ts`.
-8. `packages/catalog/src/provider-models/openai-compat.ts` (or a sibling provider-models file) — the
-   discovery mapper and model-manager factory, if discovery needs bespoke response handling.
-9. `packages/catalog/src/provider-models/descriptors.ts` — `MODEL_MANAGER_FACTORIES` entry.
+8. `packages/catalog/src/provider-models/openai-compat.ts` (or a sibling provider-models file) — a
+   model-manager factory, if the provider has any runtime discovery at all. For a plain
+   OpenAI-compatible host this is usually a one-line `createSimpleOpenAICompletionsOptions(providerId,
+   baseUrl, config)` wrapper; write a bespoke discovery mapper only when the response shape needs it.
+9. `packages/catalog/src/provider-models/descriptors.ts` — `MODEL_MANAGER_FACTORIES` entry, if step 8
+   added a factory (skip both for the bespoke no-factory cases in
+   [The five places a provider can touch](#the-five-places-a-provider-can-touch) above).
 10. `packages/catalog/test/<id>-provider.test.ts` / `<id>-wire.test.ts` — discovery-mapping and
     compat-resolution tests.
 11. `packages/ai/src/registry/<id>.ts` — `ProviderTransport`, if request/discovery shaping needs

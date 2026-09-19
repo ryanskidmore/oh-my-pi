@@ -132,7 +132,49 @@ describe("Cloudflare Workers AI models-search discovery", () => {
 		expect(gptOss?.reasoning).toBe(true);
 		expect(gptOss?.thinking).toBeUndefined();
 		expect(gptOss?.cost.cacheRead).toBe(0);
-		expect(gptOss?.maxTokens).toBe(32_768);
+		// 128,000 context: a quarter is 32,000, below the shared 32,768 discovery default.
+		expect(gptOss?.maxTokens).toBe(32_000);
+	});
+
+	test("the seeded output cap leaves room for the prompt on small-context rows", async () => {
+		// The provider KDL sets `always-send-max-tokens #true`, so the seeded cap rides EVERY
+		// request and the endpoint validates `prompt + max_tokens <= context_length`. Clamping the
+		// cap to the context window alone made them equal on rows at or below the 32,768 default,
+		// so every request 400ed with "This model's maximum context length is 24000 tokens.
+		// However, you requested 24000 output tokens and your prompt contains …" — omp has no
+		// request-time context-aware clamp. A quarter of the window keeps three quarters for the
+		// prompt.
+		const smallRow = (id: string, contextLength: number) => ({
+			id,
+			name: id,
+			input_modalities: ["text"],
+			context_length: contextLength,
+			max_output_length: contextLength,
+			pricing: { prompt: "0.0000001000", completion: "0.0000002000" },
+			supported_features: ["tools"],
+		});
+		const fetch = (async () =>
+			jsonResponse({
+				result_info: { total_count: 2 },
+				data: [
+					smallRow("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 24_000),
+					smallRow("@cf/qwen/qwen3-30b-a3b-fp8", 32_768),
+				],
+			})) as unknown as FetchImpl;
+
+		const models = await discover(fetch);
+		const byId = new Map(models?.map(model => [model.id, model]));
+		const llama = byId.get("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
+		expect(llama?.contextWindow).toBe(24_000);
+		expect(llama?.maxTokens).toBe(6000);
+		const qwen = byId.get("@cf/qwen/qwen3-30b-a3b-fp8");
+		expect(qwen?.contextWindow).toBe(32_768);
+		expect(qwen?.maxTokens).toBe(8192);
+		// The cap must always leave the majority of the window for the prompt. A row that lost its
+		// context window would fail this too, which is the intent.
+		for (const model of models ?? []) {
+			expect(model.maxTokens).toBeLessThan(model.contextWindow ?? 0);
+		}
 	});
 
 	test("paginates until a short page and sends the documented query", async () => {

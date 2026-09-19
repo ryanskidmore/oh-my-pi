@@ -40,7 +40,11 @@ provider "cloudflare-workers-ai" priority=-1 {
 	// `prompt_cache_key` equivalent. Measured: cached_tokens 0 without it, 25984/26034 with it.
 	prompt-cache-session-header "x-session-affinity"
 	// Omitting the output cap makes the endpoint answer with its 256-token default, so a cap rides
-	// every request; discovery supplies the per-row value.
+	// every request; discovery supplies the per-row value. Because it rides EVERY request and the
+	// endpoint validates `prompt + max_tokens <= context_length`, the discovery mapper seeds that
+	// value at a quarter of the context window (capped at the shared 32768 default) so three
+	// quarters stay available for the prompt — see `mapCloudflareWorkersAiModel`. A cap equal to
+	// the whole window made small-context rows 400 on every request.
 	always-send-max-tokens #true
 	// `role: "developer"` and `store` are accepted (HTTP 200), but this endpoint accepts every
 	// unknown field it is handed, so acceptance is not evidence the semantics are honored. Both

@@ -4841,6 +4841,11 @@ function mapCloudflareWorkersAiModel(
 	const modalities = Array.isArray(record.input_modalities) ? record.input_modalities : [];
 	const contextWindow = toPositiveNumber(record.context_length, defaults.contextWindow);
 	const pricing = isRecord(record.pricing) ? record.pricing : undefined;
+	// A quarter of the context window, capped at the shared discovery default; see `maxTokens`.
+	const seededMaxTokens =
+		typeof contextWindow === "number"
+			? Math.min(OPENAI_COMPAT_DISCOVERY_DEFAULT_MAX_TOKENS, Math.floor(contextWindow / 4))
+			: OPENAI_COMPAT_DISCOVERY_DEFAULT_MAX_TOKENS;
 	return {
 		...defaults,
 		name: toModelName(record.name, defaults.name),
@@ -4853,12 +4858,19 @@ function mapCloudflareWorkersAiModel(
 		input: modalities.includes("image") ? ["text", "image"] : ["text"],
 		contextWindow,
 		// Workers AI publishes no output cap (`max_output_length` echoes the context window) and
-		// falls back to 256 tokens when a request omits one, so every row carries the shared
-		// discovery default clamped to its context. KDL `limits-patch` owns per-model corrections.
-		maxTokens: Math.min(
-			contextWindow ?? OPENAI_COMPAT_DISCOVERY_DEFAULT_MAX_TOKENS,
-			OPENAI_COMPAT_DISCOVERY_DEFAULT_MAX_TOKENS,
-		),
+		// falls back to 256 tokens when a request omits one, so every row carries a seeded cap.
+		//
+		// The seed must leave room for the prompt. The provider KDL sets
+		// `always-send-max-tokens #true`, so this value rides EVERY request, and the endpoint
+		// validates `prompt + max_tokens <= context_length`. Clamping to the context window alone
+		// made the cap equal the whole window on rows with context <= 32768, so every request
+		// failed with HTTP 400 "This model's maximum context length is 24000 tokens. However, you
+		// requested 24000 output tokens and your prompt contains …" — omp has no request-time
+		// context-aware clamp (`clampOutputToModelMax` only clamps to `model.maxTokens`). A quarter
+		// of the context window keeps three quarters for the prompt: rows at 131072+ are unchanged
+		// at the shared 32768 default, 128000 -> 32000, 32768 -> 8192, 24000 -> 6000.
+		// KDL `limits-patch` owns per-model corrections.
+		maxTokens: seededMaxTokens,
 		cost: {
 			input: toCloudflareWorkersAiRate(pricing?.prompt),
 			output: toCloudflareWorkersAiRate(pricing?.completion),

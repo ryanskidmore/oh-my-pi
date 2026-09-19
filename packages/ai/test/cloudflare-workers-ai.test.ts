@@ -581,7 +581,7 @@ describe("Cloudflare Workers AI message-content shape", () => {
 	test("the gateway mirror of the same SKU still sends a parts array", async () => {
 		// The axis is declared on provider `cloudflare-workers-ai` only; every other
 		// openai-completions provider keeps the untouched default.
-		expect(GATEWAY_MODEL.compat.requiresStringMessageContent).toBeUndefined();
+		expect(GATEWAY_MODEL.compat.requiresStringMessageContent).toBe(false);
 		const body = await capturedBody(GATEWAY_MODEL, {
 			systemPrompt: ["You are omp."],
 			messages: [

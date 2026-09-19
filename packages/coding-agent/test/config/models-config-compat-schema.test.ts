@@ -19,3 +19,22 @@ describe("OpenAICompatSchema stripImageInput", () => {
 		expect(String(parsed)).toContain("stripImageInput");
 	});
 });
+
+// `requiresStringMessageContent` is documented in docs/models.md as a `models.yml`
+// compat key (send text content as one plain string for endpoints whose per-model
+// schema rejects a multi-part `content` array, e.g. Cloudflare Workers AI). The
+// arktype object is open, so an undeclared key would be accepted silently and a
+// typo would leave the multi-part array on the wire — declare it like every other
+// documented key so a wrong value is a schema error.
+describe("OpenAICompatSchema requiresStringMessageContent", () => {
+	test("accepts the documented boolean opt-in", () => {
+		const parsed = OpenAICompatSchema({ requiresStringMessageContent: true });
+		expect(parsed instanceof type.errors).toBe(false);
+	});
+
+	test("rejects a non-boolean value like every other declared compat key", () => {
+		const parsed = OpenAICompatSchema({ requiresStringMessageContent: "yes" });
+		expect(parsed instanceof type.errors).toBe(true);
+		expect(String(parsed)).toContain("requiresStringMessageContent");
+	});
+});

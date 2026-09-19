@@ -104,11 +104,11 @@ describe("Cloudflare Workers AI resolved compat", () => {
 				baseUrl: "https://gateway.ai.cloudflare.com/v1/acct-test/my-gateway/workers-ai",
 			}),
 		);
-		expect(mirrored.compat.requiresStringMessageContent).toBeUndefined();
+		expect(mirrored.compat.requiresStringMessageContent).toBe(false);
 		expect(
 			buildModel(workersAiSpec({ provider: "openai", baseUrl: "https://api.openai.com/v1" })).compat
 				.requiresStringMessageContent,
-		).toBeUndefined();
+		).toBe(false);
 	});
 });
 

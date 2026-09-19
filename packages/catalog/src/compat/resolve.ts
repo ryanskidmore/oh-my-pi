@@ -528,10 +528,10 @@ function detectOpenAICompat(
 			isQwen &&
 			facts.revGte("3.8"),
 		requiresAssistantContentForToolCalls: facts.is("kimi") || d.isDirectDeepseekReasoning,
-		// Rule-owned and left unassigned: no host identity implies a content schema
-		// that rejects multi-part arrays, so the only way in is an explicit
+		// Rule-owned: no host identity implies a content schema that rejects
+		// multi-part arrays, so the only way in is an explicit
 		// `requires-string-message-content` axis (or a user compat override).
-		requiresStringMessageContent: undefined,
+		requiresStringMessageContent: false,
 		cacheControlFormat:
 			(d.isClinePass && (isQwen || isAnthropicModel)) || (d.isOpenRouter && isAnthropicModel)
 				? "anthropic"

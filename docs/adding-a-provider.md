@@ -1,116 +1,328 @@
 # Adding a provider
 
-A provider is described in two halves:
+A provider is declared in **KDL** and compiled by `bun run gen:compat` into the checked-in
+`packages/catalog/src/compat/rules.json`. TypeScript supplies only the parts that cannot be
+declarative: a discovery mapper that turns one upstream endpoint's JSON into `ModelSpec` rows, a
+request-shaping transport (header/body rewrites a KDL wire axis cannot express), or a bespoke login
+flow the KDL auth grammar has no node for. Everything else — default model, env-var fallback,
+discovery wiring, wire-compat quirks, thinking ladders — is authored once in KDL and read back
+through generated, typed accessors.
 
-- **Catalog half** (`packages/catalog`): one entry in the `CATALOG_PROVIDERS`
-  table (`packages/catalog/src/provider-models/descriptors.ts`) carrying the
-  `id`, `defaultModel`, runtime model-discovery factory, and catalog-generation
-  wiring. `KnownProvider`, `PROVIDER_DESCRIPTORS`, and
-  `DEFAULT_MODEL_PER_PROVIDER` are derived from this table.
-- **Auth half** (`packages/ai`): one declarative `ProviderDefinition` in the
-  registry carrying env-key fallbacks and login/refresh flows. The
-  `OAuthProvider` union, the env-key map, the `/login` provider list, the
-  `refreshOAuthToken` / `AuthStorage.login` dispatch, and the coding-agent
-  callback maps are derived from the registry.
+## The five places a provider can touch
 
-**Scope.** This is for a provider that reuses an existing wire API
-(`openai-completions`, `anthropic-messages`, `google-generative-ai`, …) — the
-common case for gateways and API-key providers, since stream dispatch keys on
-`model.api`, not `model.provider`. Adding a _new wire protocol_ (a new
-`KnownApi`) is a separate task that also touches `stream.ts` dispatch,
-`api-registry.ts`, and the catalog `types.ts`.
+| Half | File | What it declares |
+| --- | --- | --- |
+| Catalog entry | `packages/catalog/src/compat/rules/providers/<id>.kdl` | `default-model` (required — it is what makes the file a catalog provider and puts the id in the generated `KnownProvider` union), `env`, `discovery`, `dynamic-models-authoritative`, `allow-unauthenticated`, `skip-cross-provider-reference-fills`, optional `seed` rows, and the provider's cascade/compat rules |
+| Auth policy | `packages/catalog/src/compat/rules/auth/<id>.kdl` + `auth/_order.kdl` | display name, env fallback, login/refresh flow |
+| Discovery factory | `MODEL_MANAGER_FACTORIES` in `packages/catalog/src/provider-models/descriptors.ts` + a factory in `packages/catalog/src/provider-models/openai-compat.ts` | the only provider fact that stays in code |
+| Request shaping | `TRANSPORTS` in `packages/ai/src/registry/registry.ts` + `packages/ai/src/registry/<id>.ts` | `prepareModel` / `prepareRequest` / `mapSimpleOptions` / `prepareModelDiscovery` |
+| Login flow | a hook table in `packages/ai/src/registry/hooks/` + `packages/ai/src/registry/oauth/<id>.ts` | whole-flow logins the KDL grammar cannot express |
 
-## Shape
+A plain API-key provider on an existing wire API (`openai-completions`, `anthropic-messages`,
+`google-generative-ai`, …) that reuses bundled or generically-discovered rows needs only rows 1 and
+2 — see [Choosing a catalog shape](#choosing-a-catalog-shape). The exact KDL syntax for row 1 is the
+[Provider catalog grammar](../packages/catalog/src/compat/rules/README.md#provider-catalog-grammar)
+section of `packages/catalog/src/compat/rules/README.md`; for row 2 it's that same file's
+[Auth grammar](../packages/catalog/src/compat/rules/README.md#auth-grammar) section — this document
+does not repeat that grammar, only how the pieces fit together. Rows 3–5 exist for the cases that
+need code: a bespoke discovery response shape, request/header rewrites, or a login flow with more
+than one prompt.
 
-For the common case, a provider is **one catalog entry + one def file + one registry line**:
+Adding a **new wire protocol** (a new member of `Api`) is a different, larger task: it also touches
+the dispatch `switch` in `packages/ai/src/stream.ts`, `packages/ai/src/api-registry.ts`, and the
+`KnownApi` union in `packages/catalog/src/types.ts`. This document assumes you are reusing an
+existing `Api`.
 
-1. **Add an entry to `CATALOG_PROVIDERS`** in
-   `packages/catalog/src/provider-models/descriptors.ts` with the `id`,
-   `defaultModel`, the plain API-key env var(s) as `envVars`, and (usually) a
-   `createModelManagerOptions` factory. For a
-   simple OpenAI-compatible gateway, build the factory in
-   `packages/catalog/src/provider-models/openai-compat.ts` or inline with the
-   exported `createSimpleOpenAICompletionsOptions(providerId, baseUrl, config)`.
-2. **Create `packages/ai/src/registry/<id>.ts`** exporting one
-   `export const <camelId>Provider = { … } as const satisfies ProviderDefinition;`
-   with the auth fields (`login`, …). Plain env-var names live in the catalog
-   entry's `envVars`; set `envKeys` only for computed resolvers (Foundry/ADC/
-   Bedrock-style probes).
-3. **Add it to the `ALL` array** in `packages/ai/src/registry/registry.ts`
-   (one import + one array entry). `ALL` order is the `/login` list order for
-   loginable providers.
+## Worked example: Cloudflare Workers AI
 
-That is the full change for:
+`cloudflare-workers-ai` (added on `feat/cloudflare-workers-ai`) is a provider with zero bundled
+rows, a custom login flow, and a request-shaping transport — it touches all five rows. Read
+`packages/catalog/src/compat/rules/providers/charm-hyper.kdl` alongside it for the sibling that
+needed *only* row 1.
 
-- env-key-only providers,
-- providers with a simple inline API-key login flow,
-- most OpenAI-compatible gateways.
+### 1. Provider KDL — catalog entry, wire axes, and why there's no `discovery` or `seed`
 
-For a **non-trivial provider-local OAuth flow**, put the implementation in
-`packages/ai/src/registry/oauth/<vendor>.ts` and lazy-import it from the def
-file. The shared OAuth flow infrastructure it builds on lives in the same
-`registry/oauth/` directory.
+`packages/catalog/src/compat/rules/providers/cloudflare-workers-ai.kdl`:
 
-Descriptors, the default-model map, env-key map, login list, and refresh
-dispatch all update automatically; the `KnownProvider` union gains the new id
-from the catalog table and `OAuthProvider` from the registry.
+```kdl
+provider "cloudflare-workers-ai" priority=-1 {
+	default-model "@cf/moonshotai/kimi-k2.7-code"
+	env "CLOUDFLARE_WORKERS_AI_API_KEY" "CLOUDFLARE_API_TOKEN"
+	dynamic-models-authoritative #true
+	skip-cross-provider-reference-fills #true
 
-## Field reference
+	prompt-cache-session-header "x-session-affinity"
+	always-send-max-tokens #true
+	supports-developer-role #false
+	supports-store #false
+	supports-named-tool-choice #false
+	reasoning-content-field "reasoning_content"
+	thinking-mode "effort"
+	thinking-efforts "low" "medium" "high"
+	class "qwen" {
+		thinking-format "openai"
+	}
+}
+```
 
-**Catalog table entry** (`ProviderCatalogEntry`, see
-`packages/catalog/src/provider-models/descriptor-types.ts` for JSDoc):
+`default-model` is what makes this a catalog provider at all. `env` is the runtime API-key
+fallback order. `dynamic-models-authoritative #true` means a successful live fetch replaces
+whatever bundled rows exist (here, none). `skip-cross-provider-reference-fills #true` stops the
+generator from backfilling capability data from same-id rows on other providers — Workers AI's own
+`models-search` response is the deployment truth, and a same-id row behind `cloudflare-ai-gateway`
+carries a different tariff and effort ladder.
 
-| Field                        | Effect                                                                                                                                                                                                                        |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`                         | Required. Member of `KnownProvider`.                                                                                                                                                                                          |
-| `defaultModel`               | Required. Preferred model when no explicit selection is made.                                                                                                                                                                 |
-| `envVars`                    | Env var name(s), in order, for the runtime API-key fallback (`getEnvApiKey`).                                                                                                                                                 |
-| `createModelManagerOptions`  | Runtime model-discovery factory. Present (and not `specialModelManager`) ⇒ appears in `PROVIDER_DESCRIPTORS`.                                                                                                                 |
-| `allowUnauthenticated`       | Runtime creates a model manager even without a key.                                                                                                                                                                           |
-| `dynamicModelsAuthoritative` | Successful discovery replaces bundled models.                                                                                                                                                                                 |
-| `catalogDiscovery`           | `{ label, envVars?, oauthProvider?, allowUnauthenticated? }` for offline catalog generation (`generate-models.ts`). `envVars` here overrides the entry-level list when generation uses different credentials (e.g. `cursor`). |
-| `specialModelManager`        | Bespoke runtime factory (`google-antigravity` / `google-gemini-cli` / `openai-codex`); excluded from `PROVIDER_DESCRIPTORS`.                                                                                                  |
+The file deliberately has **no `discovery` node and no `seed`**: `discovery` is what enrolls a
+provider in `packages/catalog/scripts/generate-models.ts` (offline catalog generation baked into
+`models.json`), and Cloudflare's roster and pricing change on Cloudflare's schedule — baking one
+snapshot in would ship a stale hard-coded list. Runtime discovery is the only source of rows, which
+is why the id is also listed in `RUNTIME_ONLY_PROVIDERS` in
+`packages/catalog/test/compat-conformance.test.ts` (see step 3) and is skipped by
+`packages/catalog/test/provider-default-models.test.ts` (there is no bundled slice to check the
+`default-model` against).
 
-**Registry definition** (`ProviderDefinition`, see
-`packages/ai/src/registry/types.ts`):
+The rest of the block is wire-compat axes from the closed vocabulary in
+`packages/catalog/src/compat/axes.ts` — `prompt-cache-session-header`, `always-send-max-tokens`,
+`supports-developer-role`, `supports-store`, `supports-named-tool-choice`,
+`reasoning-content-field`, `thinking-mode`, `thinking-efforts`, and a nested `class "qwen"`
+refinement. Each one exists because it was measured against the live endpoint, not guessed; see
+`docs/provider-quirks.md`'s "Cloudflare Workers AI" section for the measurements.
 
-| Field                   | Effect                                                                                                                                                                                                    |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`, `name`            | Required. `name` shows in the `/login` list when the definition has a visible login flow.                                                                                                                 |
-| `available`             | Optional login-list availability flag.                                                                                                                                                                    |
-| `showInLoginList`       | Set to `false` to keep a provider with a `login` flow out of the interactive list.                                                                                                                        |
-| `envKeys`               | Computed env fallback for `getEnvApiKey`, overriding the catalog entry's `envVars`: a var name string or a `() => string \| undefined` resolver. Omit when `envVars` covers it.                           |
-| `allowsMissingApiKey`   | The provider transport can authenticate without a resolved API-key string.                                                                                                                                |
-| `prepareRequest`        | Provider-owned request shaping before generic API dispatch. Returns the model and stream options to dispatch.                                                                                             |
-| `mapSimpleOptions`      | Projects the generic simple-stream option bag into provider-owned options.                                                                                                                                |
-| `prepareModelDiscovery` | Provider-owned authentication or endpoint setup for runtime model discovery.                                                                                                                              |
-| `login`                 | Interactive login. Present ⇒ member of `OAuthProvider`, dispatchable via `AuthStorage.login`, and shown in `/login` unless `showInLoginList` is false. Returns an API-key `string` or `OAuthCredentials`. |
-| `refreshToken`          | OAuth refresher; omit for static-token providers (the dispatch returns credentials unchanged).                                                                                                            |
-| `getApiKey`             | Converts stored OAuth credentials into the API-key/token string used by the transport.                                                                                                                    |
-| `storeCredentialsAs`    | Store credentials under a different provider id (e.g. `openai-codex-device` ⇒ `openai-codex`).                                                                                                            |
-| `callbackPort`          | Present ⇒ entry in the auth-broker `CALLBACK_PORTS` map.                                                                                                                                                  |
-| `pasteCodeFlow`         | OAuth flow needs a pasted code/redirect URL ⇒ member of `PASTE_CODE_LOGIN_PROVIDERS`.                                                                                                                     |
+`priority=-1` and the bare `thinking-efforts "low" "medium" "high"` are a real
+cascade-ambiguity resolution, added after ship in commit `1d3c0fd7c2`. Reasoning rows that publish
+no `reasoning.supported_efforts` vocabulary at all (`nemotron-3-120b-a12b`, `glm-4.7-flash`, and
+others) fell through to the generic five-tier `minimal/low/medium/high/xhigh` default, and the
+endpoint 400s (AiError code 8001) on `minimal` and `xhigh`. The fix — a provider-root
+`thinking-efforts "low" "medium" "high"` — ties in rank with `classes/gpt-oss.kdl`'s unconditioned
+class-root `thinking-efforts "low" "medium" "high"` (both rank at
+`(exactness=0, dimensions=1)`), which is exactly the "two distinct rules tie on all three
+[precedence] components" case in `packages/catalog/src/compat/rules/README.md`'s
+[Precedence and ambiguity](../packages/catalog/src/compat/rules/README.md#precedence-and-ambiguity)
+section: an explicit `priority=` plus a comment naming the rule it yields to, not reordering
+declarations. The values happen to agree here, so the tie-break is cosmetic, but `gen:compat` still
+requires the explicit priority. See the full comment above `provider "cloudflare-workers-ai"` in
+the KDL file, and `providers/ollama.kdl`'s `priority=-1` for the same pattern on a different axis.
+A discovered ladder (e.g. `deepseek-v4-flash-0731`'s `[low, high, max]`) is structurally immune to
+this fallback — see [Where policy goes](#where-policy-goes).
 
-## Conventions
+### 2. Auth KDL + the `_order.kdl` line
 
-- Use `... as const satisfies ProviderDefinition` so the literal `id` is preserved
-  for the union derivation.
-- `login` / `refreshToken` for simple API-key or validation-based flows can live
-  directly in the provider def file (export the named login function there so
-  tests can import it directly).
-- `login` / `refreshToken` for heavy provider-local OAuth flows MUST reach the
-  adjacent `registry/oauth/*` module via a dynamic-import
-  thunk (`const { loginX } = await import("./oauth/x"); return loginX(cb);`),
-  keeping those flows out of the eager startup graph.
-- All OAuth code lives under `registry/oauth/`: the shared flow infra
-  (`callback-server`, `pkce`, `google-oauth-shared`, `types`, the runtime API
-  `index`) plus every provider flow, including the `github-copilot` / `kimi` /
-  `openai-codex` helpers reused by the streaming and usage layers. The non-OAuth
-  API-key helpers (`api-key-login`, `api-key-validation`) sit beside the def
-  files in `registry/`, since they back simple paste-an-API-key logins.
-- For a simple OpenAI-compatible gateway, build the manager inline with the
-  exported `createSimpleOpenAICompletionsOptions(providerId, baseUrl, config)` —
-  no edits to `openai-compat.ts` required.
-- A `ProviderDefinition` may also be registered at runtime by an extension via
-  `registerOAuthProvider` (the `AuthStorage.login` dispatcher handles built-ins
-  and extensions through the same path).
+`packages/catalog/src/compat/rules/auth/cloudflare-workers-ai.kdl`:
+
+```kdl
+auth "cloudflare-workers-ai" {
+	name "Cloudflare Workers AI"
+	login "custom" hook="cloudflare-workers-ai"
+}
+```
+
+`login "custom" hook="cloudflare-workers-ai"` means the whole login flow is a named TypeScript hook
+rather than a declarative `api-key`/`oauth-code`/`device-code` flow — see step 5.
+
+`packages/catalog/src/compat/rules/auth/_order.kdl` pins the `/login` roster order; every provider
+whose auth node declares a `login` (and doesn't set `show-in-login-list #false`) must appear in its
+single `login-order "…" …` node. This provider's id was inserted immediately before
+`"cloudflare-ai-gateway"`:
+
+```
+… "vercel-ai-gateway" "cloudflare-workers-ai" "cloudflare-ai-gateway" "litellm" …
+```
+
+Skip this and `bun run gen:compat` fails with `loginable provider "cloudflare-workers-ai" is
+missing from login-order` (the check lives in
+`packages/catalog/scripts/compat-compiler/compile-auth.ts`).
+
+### 3. Regenerate and commit the compiled output
+
+```sh
+bun run gen:compat
+```
+
+This compiles every `.kdl` file under `packages/catalog/src/compat/rules/` into three generated
+files — **never hand-edit them**:
+
+- `packages/catalog/src/compat/rules.json` — the full compiled rule tree the runtime engine reads
+- `packages/catalog/src/compat/provider-ids.ts` — gains `| "cloudflare-workers-ai"` in the
+  `KnownProvider` union
+- `packages/catalog/src/compat/auth-ids.ts` — gains it in both the auth-id and login-id unions
+
+Commit all three alongside the KDL change; `test/compat-compile.test.ts` fails if `rules.json`
+drifts from the KDL sources.
+
+### 4. Discovery factory and its `MODEL_MANAGER_FACTORIES` entry
+
+`packages/catalog/src/provider-models/openai-compat.ts` gained
+`cloudflareWorkersAiModelManagerOptions` (a paginated `GET {account}/ai/models/search` fetcher plus
+a mapper from Cloudflare's OpenRouter-shaped projection onto `ModelSpec<"openai-completions">`).
+`packages/catalog/src/provider-models/descriptors.ts`'s `MODEL_MANAGER_FACTORIES` table — the *only*
+provider fact this codebase keeps in TypeScript instead of KDL — pairs it with the id:
+
+```ts
+"cloudflare-workers-ai": config => cloudflareWorkersAiModelManagerOptions(config),
+```
+
+`PROVIDER_DESCRIPTORS` (also in `descriptors.ts`) is derived by joining every compiled KDL provider
+entry (`providerEntries()`) with its `MODEL_MANAGER_FACTORIES` entry, if any; providers without a
+factory keep a KDL entry but no runtime discovery. `DEFAULT_MODEL_PER_PROVIDER` is read straight off
+the compiled entries' `default-model`.
+
+### 5. Transport and login hook
+
+`packages/ai/src/registry/cloudflare-workers-ai.ts` exports `cloudflareWorkersAiTransport: ProviderTransport`
+— it implements `prepareRequest` (unwraps the stored JSON credential, substitutes the account id
+into the `<account>` placeholder in `model.baseUrl`) and `prepareModelDiscovery` (the same
+substitution before a runtime discovery fetch). It does **not** set the `x-session-affinity` header
+in code — that rides the `prompt-cache-session-header` wire axis declared in step 1, applied
+generically in `packages/ai/src/providers/openai-shared.ts` (`resolveOpenAIRequestSetup`). Never
+hard-code model- or provider-conditional policy in TypeScript when a KDL axis already exists for it.
+
+`packages/ai/src/registry/registry.ts`'s `TRANSPORTS` table wires the transport to the id:
+
+```ts
+const TRANSPORTS: Record<string, ProviderTransport> = {
+	…
+	"cloudflare-workers-ai": cloudflareWorkersAiTransport,
+	…
+};
+```
+
+`PROVIDER_REGISTRY` maps every compiled auth policy (`authProviders()`) through
+`buildProviderDefinition(policy, TRANSPORTS[policy.id])`; a provider with no `TRANSPORTS` entry
+still gets a full `ProviderDefinition` from its KDL auth policy alone. A compile-time check
+(`_CheckRegistryComplete` in `registry.ts`) makes it a **type error** — not a runtime surprise — to
+add a KDL catalog entry without a matching KDL auth entry.
+
+The login flow itself lives in `packages/ai/src/registry/oauth/cloudflare-workers-ai.ts`
+(`loginCloudflareWorkersAi`, prompting for a Cloudflare API token and account id) and is wired into
+`API_KEY_LOGIN_HOOKS` in `packages/ai/src/registry/hooks/api-key.ts`:
+
+```ts
+"cloudflare-workers-ai": () => import("../oauth/cloudflare-workers-ai").then(m => m.loginCloudflareWorkersAi),
+```
+
+`login "custom" hook="…"` resolves against `HOOKS.login`, the table `packages/ai/src/registry/hooks/index.ts`
+merges from **every** hook-table file (`api-key.ts`'s `API_KEY_LOGIN_HOOKS`, `oauth-code.ts`'s
+`OAUTH_CODE_LOGIN_HOOKS`, `custom.ts`'s `CUSTOM_LOGIN_HOOKS`) — not only `hooks/custom.ts`. A simple
+paste-a-token(-and-something-else) flow like this one belongs beside the other API-key hooks in
+`api-key.ts`; reserve `custom.ts` for flows with no simpler category. `bun --cwd=packages/ai test
+test/auth-hooks-registry.test.ts` asserts every `hook="…"` name in the compiled auth tree resolves
+against one of these tables.
+
+## Choosing a catalog shape
+
+- **Bundled rows from the shared catalog, no runtime discovery** — most API-key providers on an
+  existing OpenAI-compatible host. No `discovery` node; the models are already in `models.json` from
+  a `models.dev`-sourced descriptor.
+- **`discovery label="…"`** — enrolls the provider in `generate-models.ts` so its live catalog is
+  fetched and baked into `models.json` at generation time (offline, with generation-time
+  credentials). Example: `anthropic` (`packages/catalog/src/compat/rules/providers/anthropic.kdl`).
+- **`seed … bundle="always" | "fallback" | "empty"`** — for catalogs that cannot be discovered at
+  generation time: authored rows that the generator bundles per policy (`always`: every regen;
+  `fallback`: only when live discovery failed; `empty`: only when no other source produced a row).
+  Examples: `cloudflare-ai-gateway` (`bundle="empty"`, `providers/cloudflare-ai-gateway.kdl`),
+  `sakana` (`bundle="fallback"`, `providers/sakana.kdl`). See "Seed rows" in
+  `packages/catalog/src/compat/rules/README.md` for the full grammar.
+- **No bundled rows at all** — runtime discovery is the only source: `charm-hyper`,
+  `cloudflare-workers-ai`, and the local engines `litellm` / `vllm` / `lm-studio` / `ollama`. The
+  local engines are additionally listed in `DISCOVERY_ONLY_PROVIDERS` in
+  `packages/catalog/scripts/generate-models.ts` (they are never fetched at generation time *and*
+  their previous-snapshot rows are dropped, since their catalog is whatever happens to be running on
+  the machine that invoked the generator). `charm-hyper` and `cloudflare-workers-ai` reach "no
+  bundled rows" purely by omitting the `discovery` node — the generator's fetch loop
+  (`PROVIDER_DESCRIPTORS.filter(isCatalogDescriptor)`) never sees them, so
+  `charm-hyper`/`cloudflare-workers-ai` do not need `DISCOVERY_ONLY_PROVIDERS` membership. Two
+  consequences either way: the id must be added to `RUNTIME_ONLY_PROVIDERS` in
+  `packages/catalog/test/compat-conformance.test.ts`, and
+  `packages/catalog/test/provider-default-models.test.ts` skips the provider because there is no
+  bundled slice to check `default-model` against.
+
+## Where policy goes
+
+Catalog policy lives in one of three ownership strata under `packages/catalog/src/compat/rules/`
+(see `packages/catalog/src/compat/rules/README.md`, which is the authoritative grammar reference —
+this section only restates the rule of where things go, per `AGENTS.md`):
+
+- `taxonomy/*.kdl` — model identity: class membership, product families, revision extraction.
+- `classes/*.kdl` — vendor-lineage truths: behavior inherent to a model line, independent of host.
+- `providers/<id>.kdl` — a provider's catalog identity plus its deployment contract: host-imposed
+  behavior and documented per-model residue that taxonomy cannot express exactly.
+- `runtime/behavior.kdl` — heuristics used before or outside exact model lookup (routing, quota
+  tiers, roster exclusions, …).
+
+Do not move a statistically common behavior into a class file, or a lineage truth into a provider
+file. The directive vocabulary itself — every axis a rule may assign — is closed and lives in
+`packages/catalog/src/compat/axes.ts`; the compiler rejects unknown directives and out-of-vocabulary
+values against that table.
+
+Resolution order, per `resolveOpenAICompletionsPolicy` and `resolveThinkingPolicy` in
+`packages/catalog/src/compat/resolve.ts`: a detected baseline (host/family/modality facts) →
+KDL cascade axes → an explicit `spec.thinking`/`spec.compat` from a discovery mapper → fixups. For
+thinking specifically, an explicit `spec.thinking` with a non-empty `efforts` array short-circuits
+straight to `fillExplicitThinking`, which only *backfills* fields the spec side left absent
+(`effortMap`, `defaultLevel`, …) — it never reassigns `thinking.efforts`. A discovered ladder is
+therefore structurally immune to any KDL `thinking-efforts` rule; the cascade's `thinking-efforts`
+is read only as `rule.efforts` when the discovery mapper left `thinking` unset entirely (see the
+Cloudflare Workers AI worked example above for a concrete case).
+
+`bun run gen:compat` throws `AmbiguousOverlapError` (`packages/catalog/src/compat/cascade.ts`) when
+two rules tie on `(model-selector exactness, constrained-dimension count, priority)` for the same
+axis. Resolve it with an explicit `priority=` on the block plus a `//` comment naming the rule it
+intentionally yields to (or wins over) — never by reordering declarations, and never by adding a
+provider- or model-conditional special case in TypeScript.
+
+## Tests to write and run
+
+Standing list, run from the repo root unless noted:
+
+```sh
+bun run gen:compat
+bun --cwd=packages/catalog test test/compat-compile.test.ts test/compat-conformance.test.ts \
+     test/compat-cascade.test.ts test/compat-taxonomy.test.ts test/compat-parity.test.ts \
+     test/descriptors.test.ts test/provider-default-models.test.ts
+bun --cwd=packages/ai test test/auth-hooks-registry.test.ts
+bun run check:ts
+bun run check:tools
+```
+
+Plus, for a new provider:
+
+- A catalog test with a mocked `fetch` proving the discovery mapping —
+  `packages/catalog/test/<id>-provider.test.ts` (worked example:
+  `packages/catalog/test/cloudflare-workers-ai-provider.test.ts`), and often a companion
+  `<id>-wire.test.ts` asserting the credential/base-URL helpers and the resolved compat contract via
+  `buildModel` (worked example: `packages/catalog/test/cloudflare-workers-ai-wire.test.ts`).
+- An `ai` test proving login, request shaping, and any recorded stream quirk —
+  `packages/ai/test/<id>.test.ts` (worked example: `packages/ai/test/cloudflare-workers-ai.test.ts`).
+
+House rules that apply to all of these: no `mock.module()`, no source-grepping tests, and no
+long-lived mutation of `Bun.env`/`process.env` — use the `withEnv` helper at
+`packages/ai/test/helpers/index.ts`. Every test defends a named, externally observable contract.
+
+## Checklist
+
+1. `packages/catalog/src/wire/<id>.ts` — credential parse/serialize helpers, if the provider stores
+   a structured (non-bearer) credential.
+2. `packages/catalog/src/compat/rules/providers/<id>.kdl` — catalog entry + wire/thinking axes.
+3. `packages/catalog/src/compat/rules/auth/<id>.kdl` — auth policy.
+4. `packages/catalog/src/compat/rules/auth/_order.kdl` — insert the id into `login-order` if the
+   auth policy declares a `login`.
+5. `packages/catalog/src/identity/priority.ts` — add the id to `DEFAULT_MODEL_PROVIDER_ORDER` if it
+   should participate in automatic role selection.
+6. `packages/catalog/test/compat-conformance.test.ts` — add to `RUNTIME_ONLY_PROVIDERS` if the
+   provider has no bundled rows.
+7. Run `bun run gen:compat`; commit `rules.json`, `provider-ids.ts`, `auth-ids.ts`.
+8. `packages/catalog/src/provider-models/openai-compat.ts` (or a sibling provider-models file) — the
+   discovery mapper and model-manager factory, if discovery needs bespoke response handling.
+9. `packages/catalog/src/provider-models/descriptors.ts` — `MODEL_MANAGER_FACTORIES` entry.
+10. `packages/catalog/test/<id>-provider.test.ts` / `<id>-wire.test.ts` — discovery-mapping and
+    compat-resolution tests.
+11. `packages/ai/src/registry/<id>.ts` — `ProviderTransport`, if request/discovery shaping needs
+    code.
+12. `packages/ai/src/registry/registry.ts` — `TRANSPORTS` entry.
+13. `packages/ai/src/registry/oauth/<id>.ts` + a `packages/ai/src/registry/hooks/*.ts` table entry —
+    login flow, if it needs more than the declarative `api-key`/`oauth-code`/`device-code` grammar.
+14. `packages/ai/test/<id>.test.ts` — login, request-shaping, and stream-quirk tests.
+15. `bun run check:ts` and `bun run check:tools`.
+16. Docs and changelogs: `docs/providers.md`, `docs/environment-variables.md`,
+    `docs/provider-quirks.md`, `packages/ai/README.md`, and one line under `## [Unreleased]` /
+    `### Added` in each affected `packages/*/CHANGELOG.md`.

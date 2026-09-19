@@ -50,8 +50,12 @@ bespoke manager the coding-agent runtime builds directly
 (`SPECIAL_MODEL_MANAGER_PROVIDER_IDS` in
 `packages/coding-agent/src/config/model-provider-discovery.ts`) instead of going through this table.
 
-Rows 4 and 5 exist only for the cases that need code beyond a one-line factory: a bespoke discovery
-response shape, request/header rewrites, or a login flow with more than one prompt.
+Row 3 itself grows beyond that one-line wrapper into a bespoke fetcher and mapper in
+`openai-compat.ts` when the provider's model-list response is not OpenAI-shaped — Cloudflare
+Workers AI (the worked example below) is exactly this case: its `models-search` endpoint has no
+OpenAI-compatible `/v1/models` route at all. Rows 4 and 5 exist for different needs: row 4 (a
+transport) for request/header/base-URL rewrites a KDL wire axis cannot express, and row 5 (a login
+hook) for a login flow beyond a single API-key prompt.
 
 Adding a **new wire protocol** (a new member of `Api`) is a different, larger task: it also touches
 the dispatch `switch` in `packages/ai/src/stream.ts`, `packages/ai/src/api-registry.ts`, and the

@@ -52,10 +52,11 @@ bespoke manager the coding-agent runtime builds directly
 
 Row 3 itself grows beyond that one-line wrapper into a bespoke fetcher and mapper in
 `openai-compat.ts` when the provider's model-list response is not OpenAI-shaped — Cloudflare
-Workers AI (the worked example below) is exactly this case: its `models-search` endpoint has no
-OpenAI-compatible `/v1/models` route at all. Rows 4 and 5 exist for different needs: row 4 (a
-transport) for request/header/base-URL rewrites a KDL wire axis cannot express, and row 5 (a login
-hook) for a login flow beyond a single API-key prompt.
+Workers AI (the worked example below) is exactly this case: the host has no OpenAI-compatible
+`/v1/models` route at all (`GET {account}/ai/v1/models` returns HTTP 405), so discovery instead
+calls the account-scoped `models-search` endpoint (`GET {account}/ai/models/search`). Rows 4 and 5
+exist for different needs: row 4 (a transport) for request/header/base-URL rewrites a KDL wire axis
+cannot express, and row 5 (a login hook) for a login flow beyond a single API-key prompt.
 
 Adding a **new wire protocol** (a new member of `Api`) is a different, larger task: it also touches
 the dispatch `switch` in `packages/ai/src/stream.ts`, `packages/ai/src/api-registry.ts`, and the

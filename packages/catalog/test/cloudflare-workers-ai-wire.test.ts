@@ -11,7 +11,7 @@ import {
 	toCloudflareWorkersAiSpecBaseUrl,
 } from "@oh-my-pi/pi-catalog/wire/cloudflare-workers-ai";
 
-function workersAiSpec(): ModelSpec<"openai-completions"> {
+function workersAiSpec(overrides: Partial<ModelSpec<"openai-completions">> = {}): ModelSpec<"openai-completions"> {
 	return {
 		id: "@cf/zai-org/glm-5.3-flash",
 		name: "GLM 5.3 Flash",
@@ -24,6 +24,7 @@ function workersAiSpec(): ModelSpec<"openai-completions"> {
 		contextWindow: 1_310_720,
 		maxTokens: 32_768,
 		thinking: { mode: "effort", efforts: [Effort.Low, Effort.High, Effort.Max] },
+		...overrides,
 	};
 }
 
@@ -77,6 +78,47 @@ describe("Cloudflare Workers AI resolved compat", () => {
 		expect(model.compat.reasoningContentField).toBe("reasoning_content");
 		// The default never sends the 400-producing `reasoning_effort: "none"`.
 		expect(model.compat.reasoningDisableMode).not.toBe("none-effort");
+	});
+});
+
+describe("Cloudflare Workers AI effort ladder", () => {
+	// Regression coverage for the live-sweep bug: rows that reason (`supported_features`
+	// includes `reasoning`) but publish no `reasoning.supported_efforts` vocabulary were built
+	// with the generic five-tier ladder (minimal/low/medium/high/xhigh). The endpoint 400s
+	// (AiError code 8001) on `minimal` and `xhigh`, and because this provider's disable mode is
+	// `lowest-effort`, turning thinking off sent the rejected `minimal` tier. `buildModel` is
+	// the same path production uses (`compat/resolve.ts`'s `resolveThinkingPolicy`), so these
+	// tests exercise the cascade fix in `providers/cloudflare-workers-ai.kdl`, not the discovery
+	// mapper.
+	test.each(["@cf/zai-org/glm-4.7-flash", "@cf/nvidia/nemotron-3-120b-a12b"])(
+		"%s reasons without a discovered vocabulary and gets exactly low/medium/high",
+		id => {
+			const model = buildModel(workersAiSpec({ id, name: id, thinking: undefined }));
+			expect(model.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High]);
+		},
+	);
+
+	test("a row with a discovered ladder keeps exactly what discovery supplied", () => {
+		// glm-5.3-flash-shaped row: discovery mapped `[low, high, max]` (mirrors deepseek's
+		// shape). The KDL fallback must never widen or narrow an explicit ladder.
+		const model = buildModel(workersAiSpec());
+		expect(model.thinking?.efforts).toEqual([Effort.Low, Effort.High, Effort.Max]);
+	});
+
+	test("gpt-oss keeps its class-cascade ladder, not a duplicated provider rule", () => {
+		// classes/gpt-oss.kdl's unconditioned class-root `thinking-efforts` ties with the
+		// provider-root fallback at the same (exactness, dimension) rank; the provider rule's
+		// priority=-1 yields the tie instead of `gen:compat` throwing `AmbiguousOverlapError`.
+		// Confirms the resolved value is unaffected by adding the provider-root fallback.
+		const model = buildModel(
+			workersAiSpec({ id: "@cf/openai/gpt-oss-120b", name: "GPT-OSS 120B", thinking: undefined }),
+		);
+		expect(model.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High]);
+	});
+
+	test("a non-reasoning row gets no thinking policy at all", () => {
+		const model = buildModel(workersAiSpec({ reasoning: false, thinking: undefined }));
+		expect(model.thinking).toBeUndefined();
 	});
 });
 

@@ -12,7 +12,21 @@
 // baking one snapshot into models.json would ship a stale hard-coded list. Runtime discovery is
 // the only source of rows, which is why `cloudflare-workers-ai` is listed in
 // compat-conformance.test.ts's RUNTIME_ONLY_PROVIDERS.
-provider "cloudflare-workers-ai" {
+//
+// priority=-1: `thinking-efforts` below is a generic fallback for rows that reason
+// (`supported_features` includes `reasoning`) but publish no `reasoning.supported_efforts`
+// vocabulary at all (nemotron-3-120b-a12b, glm-4.7-flash, qwen3-30b-a3b-fp8, qwen3.8-27b,
+// gpt-oss). A discovered ladder always wins regardless of this priority — `resolve.ts`'s
+// `resolveThinkingPolicy` only reaches the cascade `rule.efforts` fallback when
+// `spec.thinking` is undefined (an explicit `thinking.efforts` short-circuits straight to
+// `fillExplicitThinking`, which never touches the ladder) — so this can never clobber a
+// discovered ladder such as deepseek's `[low, high, max]` or kimi's `[high]`. The negative
+// priority only matters for gpt-oss: `classes/gpt-oss.kdl`'s unconditioned class-root
+// `thinking-efforts "low" "medium" "high"` ties with this rule at the same
+// (exactness=0, dimensions=1) rank, and `-1` lets the lineage-scoped class rule win the tie
+// instead of `gen:compat` throwing `AmbiguousOverlapError` (the two rules agree on the value,
+// so the tie-break is cosmetic, but an explicit priority is required either way).
+provider "cloudflare-workers-ai" priority=-1 {
 	default-model "@cf/moonshotai/kimi-k2.7-code"
 	env "CLOUDFLARE_WORKERS_AI_API_KEY" "CLOUDFLARE_API_TOKEN"
 	dynamic-models-authoritative #true
@@ -43,6 +57,12 @@ provider "cloudflare-workers-ai" {
 	// Reasoning depth is selected with OpenAI `reasoning_effort`, never Qwen-native thinking
 	// fields. Same contract as providers/cerebras.kdl.
 	thinking-mode "effort"
+	// The endpoint 400s (`AiError` code 8001, "Invalid input") on `reasoning_effort: "minimal"`
+	// and `"xhigh"` for rows that never advertised those tiers; the documented enum is
+	// low/medium/high. Without this, ladderless reasoning rows fell back to the generic
+	// five-tier scale, and because this provider's disable mode is `lowest-effort`, turning
+	// thinking off sent `minimal` and failed on every request. See priority= comment above.
+	thinking-efforts "low" "medium" "high"
 	class "qwen" {
 		thinking-format "openai"
 	}
